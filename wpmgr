@@ -1,0 +1,307 @@
+#!/usr/bin/python3
+
+from pathlib import Path
+from random import randint
+from json import dump, load
+from urllib.parse import quote
+from subprocess import run
+from shlex import split
+from sys import argv
+
+# --- settings ---
+SETFILE = Path.home() / ".wpmgr-settings"
+
+class Settings:
+    def __init__(self):
+        try:
+            with open(SETFILE, "r") as s:
+                data = load(s)
+        except Exception:
+            data = {}
+
+        self.hlen = data.get("history_length", 20)
+        self.wpfolder = Path(data.get("wallpaper_folder", "~/Desktop/Wallpapers")).expanduser()
+        self.pfile = self.wpfolder / ".persist"
+        self.exts = data.get("wallpaper_file_extensions")
+        self._urisafe = data.get("set_commands_require_uri_safe", True)
+        if not isinstance(self.exts, list):
+            self.exts = ["jpg", "jpeg", "png", "webp"]
+        self.cmds = data.get("wallpaper_set_commands_%P_as_wallpaper_full_path")
+        if not isinstance(self.cmds, list):
+            self.cmds = ["gsettings set org.gnome.desktop.background picture-uri-dark file://%P", "gsettings set org.gnome.desktop.background picture-uri file://%P"]
+
+        with open(SETFILE, "w") as s:
+            dump({
+                "history_length":self.hlen,
+                "wallpaper_folder":str(self.wpfolder),
+                "wallpaper_file_extensions":self.exts,
+                "wallpaper_set_commands_%P_as_wallpaper_full_path":self.cmds,
+                "set_commands_require_uri_safe":self._urisafe
+            }, s, indent=4)
+
+# --- persistence ---
+class Persistence:
+    def __init__(self, settings: Settings, folder: Path):
+        hlen = settings.hlen if isinstance(settings.hlen, int) else 1
+        self.hlen = max(hlen, 1)
+        self.pfile = settings.pfile
+        self.history = []
+        self.future = []
+        
+        # calculate folder modification time safely
+        self._load_data()
+
+    def _load_data(self):
+        if not self.pfile.is_file():
+            return
+        try:
+            with open(self.pfile, "r") as s:
+                data = load(s)
+            
+            self.history = [Path(p) for p in data.get("h", [])]
+            self.future = [Path(p) for p in data.get("f", [])]
+        except Exception:
+            pass # fallback to empty states if JSON is corrupted
+
+    def dump(self):
+        data = {
+            "f": [str(p) for p in self.future],
+            "h": [str(p) for p in self.history[-self.hlen:]]
+        }
+        with open(self.pfile, "w") as s:
+            dump(data, s, indent=4)
+
+class NoWallpapers(Exception): pass
+
+# --- engine ---
+class Engine:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.wpfolder = settings.wpfolder
+        self.wpfolder.mkdir(parents=True, exist_ok=True)
+            
+        self.wps = self._get_wps()
+        if not self.wps:
+            raise NoWallpapers(f"No wallpapers found in {self.wpfolder}")
+            
+        # initialize persistence after files are parsed
+        self.persist = Persistence(settings, self.wpfolder)
+
+        available = set(self.wps)
+        self.persist.history = [
+            p for p in self.persist.history
+            if p in available
+        ]
+        self.persist.future = [
+            p for p in self.persist.future
+            if p in available
+        ]
+
+    def _get_wps(self) -> list[Path]:
+        wps = {
+            p.resolve()
+            for ext in self.settings.exts
+            for p in self.wpfolder.rglob(f"*.{ext}")
+        }
+        return sorted(wps, key=lambda p: str(p).casefold())
+
+    def setwp(self, wp: Path):
+        if not wp.is_file():
+            return
+        for cmd_template in self.settings.cmds:
+            if self.settings._urisafe:
+                _wp = quote(str(wp), safe="/")
+            else:
+                _wp = f"'{wp}'"
+            exec_cmd = cmd_template.replace("%P", _wp)
+            run(split(exec_cmd))
+
+    def next(self):
+        _p = self.persist
+        if _p.future:
+            i = _p.future.pop(0)
+        else:
+            # fallback if history is empty
+            if _p.history:
+                last_i = _p.history[-1]
+                if last_i in self.wps:
+                    _i = (self.wps.index(last_i) + 1) % len(self.wps)
+                    i = self.wps[_i]
+                else:
+                    i = self.wps[0]
+            else:
+                i = self.wps[0]
+                
+        _p.history.append(i)
+        self.setwp(i)
+    
+    def prev(self):
+        _p = self.persist
+        if len(_p.history) <= 1:
+            return  # no older wallpaper to step back to
+            
+        current = _p.history.pop(-1)
+        _p.future.insert(0, current)  # prepend back into future list
+        
+        # display the previous wallpaper remaining in history
+        i = _p.history[-1]
+        self.setwp(i)
+    
+    def rand(self):
+        _p = self.persist
+        _p.future.clear()
+        if len(self.wps) == 1:
+            i = self.wps[0]
+        elif _p.history:
+            current = _p.history[-1]
+            choices = [p for p in self.wps if p != current]
+            i = choices[randint(0, len(choices) - 1)]
+        else:
+            i = self.wps[randint(0, len(self.wps) - 1)]
+        _p.history.append(i)
+        self.setwp(i)
+
+    def clear(self):
+        self.persist.history.clear()
+        self.persist.future.clear()
+
+def create_desktop_icons(color):
+    ICONDIR = Path.home() / ".local/share/icons"
+    ICONDIR.mkdir(parents=True, exist_ok=True)
+    DESKTOP = Path.home() / "Desktop"
+    DESKTOP.mkdir(exist_ok=True)
+    def _open(file, text:str):
+        with open(file, "w") as f:
+            f.write(text)
+    print("Creating icons")
+    clearico = ICONDIR/"wpmgr-clear.svg"
+    nextico = ICONDIR/"wpmgr-next.svg"
+    previco = ICONDIR/"wpmgr-prev.svg"
+    randico = ICONDIR/"wpmgr-rand.svg"
+    _open(clearico, f"""<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <rect x="80" y="136" width="352" height="240"
+        rx="24"
+        fill="none"
+        stroke="{color}"
+        stroke-width="48" />
+  <path d="M 176 200 L 336 312
+           M 336 200 L 176 312"
+        fill="none"
+        stroke="{color}"
+        stroke-width="48"
+        stroke-linecap="round"
+        stroke-linejoin="round" />
+</svg>""")
+    _open(nextico, f"""<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <path d="M 160 96 L 352 256 L 160 416" 
+        fill="none" 
+        stroke="{color}" 
+        stroke-width="56" 
+        stroke-linecap="round" 
+        stroke-linejoin="round" />
+</svg>""")
+    _open(previco, f"""<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <path d="M 352 96 L 160 256 L 352 416" 
+        fill="none" 
+        stroke="{color}" 
+        stroke-width="56" 
+        stroke-linecap="round" 
+        stroke-linejoin="round" />
+</svg>""")
+    _open(randico, f"""<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <path d="M 256 96 L 256 416
+           M 117 176 L 395 336
+           M 117 336 L 395 176"
+        fill="none"
+        stroke="{color}"
+        stroke-width="56"
+        stroke-linecap="round"
+        stroke-linejoin="round" />
+</svg>
+""")
+    print("Creating .desktop files")
+    clearc = DESKTOP/"wpmgr-clear.desktop"
+    nextc = DESKTOP/"wpmgr-next.desktop"
+    prevc = DESKTOP/"wpmgr-prev.desktop"
+    randc = DESKTOP/"wpmgr-rand.desktop"
+    _open(clearc, f"""[Desktop Entry]
+Name=Clear History
+Exec=wpmgr clear
+Terminal=false
+Type=Application
+Icon={clearico}""")
+    _open(nextc, f"""[Desktop Entry]
+Name=Next Wallpaper
+Exec=wpmgr next
+Terminal=false
+Type=Application
+Icon={nextico}""")
+    _open(prevc, f"""[Desktop Entry]
+Name=Previous Wallpaper
+Exec=wpmgr prev
+Terminal=false
+Type=Application
+Icon={previco}""")
+    _open(randc, f"""[Desktop Entry]
+Name=Random Wallpaper
+Exec=wpmgr rand
+Terminal=false
+Type=Application
+Icon={randico}""")
+    print("Done!")
+
+def _color(colorstr:str):
+    if "#" in colorstr:
+        i = colorstr.index("#")
+        c = colorstr[i+1:i+6]
+    else:
+        c = colorstr[:6]
+    c = c.lower()
+    nc = c
+    for i, _c in enumerate(c):
+        if _c not in "0123456789abcdef":
+            print(f"! {c[i]} is invalid for hex color and replaced with 'f'")
+            nc = nc[:i]+"f"+nc[i+1:]
+    while not len(nc) >= 6:
+        nc += "f"
+    return "#"+nc
+
+def main():
+    config = Settings()
+
+    if len(argv) >= 2:
+        action = argv[1].lower()
+    else:
+        action = "next"
+
+    if action == "setup":
+        color = "#ffffff" if len(argv) < 3 else _color(argv[2])
+        create_desktop_icons(color)
+        return
+
+    try:
+        engine = Engine(config)
+    except NoWallpapers as e:
+        print(f"Error: {e}")
+        return
+    
+    if action == "next":
+        engine.next()
+    elif action == "prev":
+        engine.prev()
+    elif action == "clear":
+        engine.clear()
+    elif action == "rand":
+        engine.rand()
+    else:
+        print("OPTIONS:\n  rand  - random wallpaper\n  next  - next wallpaper\n  prev  - previous wallpaper\n  clear - clear wallpaper history\n  setup - create desktop icons for these commands")
+        return
+    
+    engine.persist.dump()
+
+if __name__ == "__main__":
+    main()
