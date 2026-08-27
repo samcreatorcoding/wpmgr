@@ -7,6 +7,7 @@ from urllib.parse import quote
 from subprocess import run
 from shlex import split
 from sys import argv
+from stat import S_IXUSR
 
 # --- settings ---
 SETFILE = Path.home() / ".wpmgr-settings"
@@ -173,7 +174,7 @@ def create_desktop_icons(color):
     def _open(file, text:str):
         with open(file, "w") as f:
             f.write(text)
-    print("Creating icons")
+    print(f"Creating icons with color {color}")
     clearico = ICONDIR/"wpmgr-clear.svg"
     nextico = ICONDIR/"wpmgr-next.svg"
     previco = ICONDIR/"wpmgr-prev.svg"
@@ -252,6 +253,11 @@ Exec=wpmgr rand
 Terminal=false
 Type=Application
 Icon={randico}""")
+    print("Setting execute permissions")
+    clearc.chmod(clearc.stat().st_mode | S_IXUSR)
+    nextc.chmod(nextc.stat().st_mode | S_IXUSR)
+    prevc.chmod(prevc.stat().st_mode | S_IXUSR)
+    randc.chmod(randc.stat().st_mode | S_IXUSR)
     print("Done!")
 
 def _color(colorstr:str):
@@ -279,7 +285,10 @@ def main():
         action = "next"
 
     if action == "setup":
-        color = "#ffffff" if len(argv) < 3 else _color(argv[2])
+        if len(argv) >= 3:
+            color = _color(argv[2])
+        else:
+            color = "#ffffff"
         create_desktop_icons(color)
         return
 
